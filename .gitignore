@@ -1,0 +1,15 @@
+# Archivos ejecutables de Windows y Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+
+# Archivos de configuración de editores (opcional)
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
