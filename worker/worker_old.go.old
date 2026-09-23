@@ -1,0 +1,136 @@
+package worker
+
+import (
+    "context"
+    "fmt"
+    "log/slog"
+    "strings"
+    "time"
+
+    "github.com/wneessen/go-mail"
+    "relay/cola"
+    "relay/config"
+)
+
+type Worker struct {
+    cola   *cola.ColaDB
+    cfg    *config.Config
+    ticker *time.Ticker
+}
+
+func Nuevo(c *cola.ColaDB, cfg *config.Config) *Worker {
+    return &Worker{
+        cola:   c,
+        cfg:    cfg,
+        ticker: time.NewTicker(time.Duration(cfg.Cola.IntervaloWorkerMs) * time.Millisecond),
+    }
+}
+
+func (w *Worker) Run(ctx context.Context) {
+    slog.Info("worker iniciado", "intervalo_ms", w.cfg.Cola.IntervaloWorkerMs)
+    for {
+        select {
+        case <-ctx.Done():
+            slog.Info("worker detenido")
+            return
+        case <-w.ticker.C:
+            w.procesarUno(ctx)
+        }
+    }
+}
+
+func (w *Worker) procesarUno(ctx context.Context) {
+    co, err := w.cola.TomarSiguientePendiente()
+    if err != nil {
+        slog.Error("error tomando pendiente", "err", err)
+        return
+    }
+    if co == nil {
+        return // nada para hacer
+    }
+
+    err = w.enviar(ctx, co)
+    if err == nil {
+        if err := w.cola.MarcarEnviado(co.ID); err != nil {
+            slog.Error("no se pudo marcar enviado", "id", co.ID, "err", err)
+            return
+        }
+        slog.Info("correo enviado", "id", co.ID, "para", co.Destinatarios)
+        return
+    }
+
+    intentos := co.Intentos + 1
+    errMsg := err.Error()
+    slog.Warn("fallo envío", "id", co.ID, "intentos", intentos, "err", errMsg)
+
+    // ¿superó el límite?
+    if intentos >= w.cfg.Cola.MaxIntentos ||
+        time.Since(co.Creado) > time.Duration(w.cfg.Cola.DiasMaxReintento)*24*time.Hour {
+        slog.Error("correo descartado por límite", "id", co.ID)
+        _ = w.cola.MarcarFallidoDefinitivo(co.ID, errMsg)
+        return
+    }
+
+    prox := time.Now().Add(backoff(intentos))
+    if err := w.cola.RegistrarFallo(co.ID, intentos, errMsg, prox); err != nil {
+        slog.Error("no se pudo registrar fallo", "id", co.ID, "err", err)
+    } else {
+        slog.Info("reintento programado", "id", co.ID, "prox", prox, "espera", backoff(intentos))
+    }
+}
+
+// Tabla idéntica al README
+func backoff(intentos int) time.Duration {
+    switch intentos {
+    case 1: return 1 * time.Minute
+    case 2: return 5 * time.Minute
+    case 3: return 15 * time.Minute
+    case 4: return 1 * time.Hour
+    case 5: return 4 * time.Hour
+    case 6: return 12 * time.Hour
+    case 7: return 24 * time.Hour
+    default: return 48 * time.Hour
+    }
+}
+
+func (w *Worker) enviar(ctx context.Context, co *cola.Correo) error {
+    opts := []mail.Option{
+        mail.WithPort(w.cfg.Destino.Puerto),
+        mail.WithSMTPAuth(mail.SMTPAuthPlain),
+        mail.WithUsername(w.cfg.Destino.Usuario),
+        mail.WithPassword(w.cfg.Destino.Password),
+    }
+
+    if w.cfg.Destino.UsarTLS {
+        switch strings.ToLower(w.cfg.Destino.TipoTLS) {
+        case "implicit":
+            opts = append(opts, mail.WithSSLPort(false)) // go-mail ya aplica SSL en 465
+            opts = append(opts, mail.WithSSL())
+        default: // explicit (587 STARTTLS)
+            opts = append(opts, mail.WithTLSPolicy(mail.TLSMandatory))
+        }
+    } else {
+        opts = append(opts, mail.WithTLSPolicy(mail.NoTLS))
+    }
+
+    msg := mail.NewMsg()
+    if err := msg.From(co.Remitente); err != nil {
+        return fmt.Errorf("from inválido: %w", err)
+    }
+    if err := msg.To(strings.Split(co.Destinatarios, ",")...); err != nil {
+        return fmt.Errorf("rcpt inválido: %w", err)
+    }
+    msg.Subject(co.Asunto)
+    msg.SetBodyString(mail.TypeTextPlain, string(co.RawMessage))
+
+    cli, err := mail.NewClient(w.cfg.Destino.Servidor, opts...)
+    if err != nil {
+        return fmt.Errorf("creando cliente: %w", err)
+    }
+    cli.SetTimeout(30 * time.Second)
+
+    if err := cli.DialAndSendWithContext(ctx, msg); err != nil {
+        return fmt.Errorf("dial+send: %w", err)
+    }
+    return nil
+}
