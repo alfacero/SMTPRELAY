@@ -18,9 +18,9 @@ type Admin struct {
 	cola *cola.ColaDB
 }
 
-func Iniciar(cfg *config.Config, colaDB *cola.ColaDB) {
+func Iniciar(cfg *config.Config, colaDB *cola.ColaDB) *http.Server {
 	if !cfg.Web.Habilitado {
-		return
+		return nil
 	}
 
 	a := &Admin{cfg: cfg, cola: colaDB}
@@ -43,19 +43,22 @@ func Iniciar(cfg *config.Config, colaDB *cola.ColaDB) {
 	mux.HandleFunc("/api/correo/", a.auth(a.handleAPIDetalle))
 
 	addr := cfg.Web.Bind + ":" + strconv.Itoa(cfg.Web.Puerto)
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+	}
+
 	go func() {
 		slog.Info("webadmin escuchando", "addr", addr)
-		srv := &http.Server{
-			Addr:              addr,
-			Handler:           mux,
-			ReadHeaderTimeout: 10 * time.Second,
-			ReadTimeout:       30 * time.Second,
-			WriteTimeout:      30 * time.Second,
-		}
-		if err := srv.ListenAndServe(); err != nil {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("webadmin murió", "err", err)
 		}
 	}()
+
+	return srv
 }
 
 // ---------------------------------------------------------------------------
