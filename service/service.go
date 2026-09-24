@@ -2,17 +2,19 @@ package service
 
 import (
 	"context"
-	smtp "github.com/emersion/go-smtp"
-	service "github.com/kardianos/service"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/emersion/go-smtp"
+	"github.com/kardianos/service"
+
 	"relay/cola"
 	"relay/config"
 	"relay/smtpserver"
 	"relay/webadmin"
 	"relay/worker"
-	"strconv"
-	"time"
 )
 
 type Programa struct {
@@ -20,7 +22,7 @@ type Programa struct {
 	cancel    context.CancelFunc
 	smtpSrv   *smtp.Server
 	webSrv    *http.Server
-	shutdownD chan struct{} // Canal para notificar a Windows que terminamos de limpiar
+	shutdownD chan struct{}
 }
 
 func Nuevo(cfg *config.Config) *Programa {
@@ -33,12 +35,14 @@ func Nuevo(cfg *config.Config) *Programa {
 func (p *Programa) Start(s service.Service) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
-
 	go p.run(ctx)
 	return nil
 }
 
 func (p *Programa) run(ctx context.Context) {
+	// Garantiza que shutdownD se cierre SIEMPRE, sin importar cómo salga run.
+	defer close(p.shutdownD)
+
 	// 1. Abrir Base de Datos
 	colaDB, err := cola.Abrir(p.cfg.Archivos.RutaDB)
 	if err != nil {
@@ -64,31 +68,26 @@ func (p *Programa) run(ctx context.Context) {
 	p.webSrv = webadmin.Iniciar(p.cfg, colaDB)
 	if p.webSrv != nil {
 		defer func() {
-			// Cierre suave de conexiones HTTP (le damos 2s max al apagarse)
-			ctxWeb, cancelWeb := context.WithTimeout(context.Background(), 2*time.Second)
+			ctxWeb, cancelWeb := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancelWeb()
 			_ = p.webSrv.Shutdown(ctxWeb)
 		}()
 	}
 
-	// 4. Arrancar Worker (Bloqueante síncrono)
+	// 4. Arrancar Worker (bloqueante hasta cancelación)
 	w := worker.Nuevo(colaDB, p.cfg)
 	w.Run(ctx)
 
-	// Al salir de w.Run por la cancelación, avanzará hacia acá ejecutando los defers.
 	slog.Info("Todos los recursos locales del relay se han cerrado limpiamente.")
-	close(p.shutdownD) // Avisamos a Stop() que ya terminó la limpieza
 }
 
 func (p *Programa) Stop(s service.Service) error {
 	slog.Info("Windows ha solicitado detener el servicio. Iniciando apagado...")
 
 	if p.cancel != nil {
-		p.cancel() // Cancela el contexto, liberando al worker y rompiendo el ciclo.
+		p.cancel()
 	}
 
-	// Esperamos a que la goroutine de run() termine de ejecutar los defers
-	// o forzamos la salida si toma más de 5 segundos.
 	select {
 	case <-p.shutdownD:
 		slog.Info("Apagado graceful completado con éxito.")

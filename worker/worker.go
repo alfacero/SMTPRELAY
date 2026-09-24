@@ -23,9 +23,15 @@ type Worker struct {
 }
 
 func Nuevo(c *cola.ColaDB, cfg *config.Config) *Worker {
-	// Definimos un límite máximo de envíos simultáneos (ej: 10).
-	// Puedes cambiar este valor según la capacidad de tu red o SMTP.
-	maxWorkers := 10
+	maxWorkers := cfg.Cola.MaxEnviosSimultaneos
+	if maxWorkers < 1 {
+		maxWorkers = 10 // default sensato si no está en el INI
+	}
+	if maxWorkers > 100 {
+		maxWorkers = 100 // tope duro: más de 100 no tiene sentido para SMTP
+	}
+
+	slog.Info("worker configurado", "max_envios_simultaneos", maxWorkers)
 
 	return &Worker{
 		cola:   c,
